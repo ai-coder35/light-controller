@@ -1,0 +1,507 @@
+/*
+ * ===============================================================
+ *  Smart Home - Child Node (ESP8266) - No mDNS (V7.2.1)
+ * ===============================================================
+ * - لا mDNS نهائيًا
+ * - اكتشاف المركز عبر UDP فقط + تخزين IP
+ * - Status فوري دائمًا (Timeout ~300ms)
+ * - Backoff خفيف فقط لـ Discover/Sensor
+ * - AP للإعداد فقط (لا Auto-AP عند فشل الراوتر)
+ * - /command: زيادة مخزن JSON إلى 256 + لوج
+ */
+
+#include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiUdp.h>
+#include <DNSServer.h>
+
+// Pins
+#define RESET_BTN_PIN 14
+#define LONG_RESET_MS 20000UL
+
+const int DEVICE_PINS[]  = {3, 4, 5};
+const int BUTTON_PINS[]  = {15, 13, 12}; // يُفضّل لاحقًا تغيير 15
+const int SENSOR_PIN     = 16;
+
+// Defaults
+const int   NUM_DEVICES = 3;
+const char* DEFAULT_ROOM_NAME = "نوم";
+const char* DEFAULT_DEVICE_NAMES[NUM_DEVICES] = {"مصباح1", "مروحه", "تلفاز"};
+const bool  DEFAULT_DEVICE_LOGICS[NUM_DEVICES] = {true, true, true};
+const char* DEFAULT_SENSOR_TYPE = "NONE";
+
+// Network
+String wifiSSID, wifiPASS;
+
+// UDP Discovery
+WiFiUDP udp;
+const uint16_t DISCOVERY_PORT = 5555;
+const uint16_t UDP_LOCAL_PORT = 4210;
+const char*    DISCOVERY_REQ  = "DISCOVER_TAHA";
+const char*    DISCOVERY_PREFIX = "TAHA_HUB|";
+const unsigned long HUB_DISCOVERY_TIMEOUT_MS = 200; // سريع
+
+// Provisioning
+bool provisioningMode = false;
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// Runtime
+AsyncWebServer server(80);
+WiFiClient wifi_client;
+DHT dht(SENSOR_PIN, DHT22);
+
+String roomName;
+String sensorType;
+String deviceNames[NUM_DEVICES];
+bool   deviceLogicHigh[NUM_DEVICES];
+
+bool device_state[NUM_DEVICES] = {false, false, false};
+
+unsigned long last_press_time[NUM_DEVICES] = {0,0,0};
+const unsigned long debounce_delay = 50;
+bool last_button_reading[NUM_DEVICES] = {HIGH,HIGH,HIGH};
+bool stable_button_state[NUM_DEVICES] = {HIGH,HIGH,HIGH};
+
+unsigned long last_announce_time = 0;
+unsigned long announce_interval  = 60000;
+unsigned long last_sensor_read_time = 0;
+const unsigned long sensor_read_interval = 10000;
+
+IPAddress hubCachedIP;
+bool hubCacheValid = false;
+unsigned long lastResolveTime = 0;
+const unsigned long RESOLVE_TTL_MS = 15000;
+
+volatile uint32_t pending_report_mask = 0;
+unsigned long last_wifi_check = 0;
+const unsigned long WIFI_RETRY_MS = 30000;
+
+bool rebootScheduled = false;
+unsigned long rebootAt = 0;
+
+// Backoff لرسائل غير حرجة
+unsigned long hubBackoffUntil = 0;
+const unsigned long HUB_BACKOFF_MS = 5000;
+
+// Helpers
+const char* logicToStr(bool h){ return h ? "HIGH" : "LOW"; }
+bool strToLogic(const String& s){ String u=s; u.toUpperCase(); return (u=="HIGH"); }
+
+void applyRelayOutput(int i, bool on){
+  bool H = deviceLogicHigh[i];
+  digitalWrite(DEVICE_PINS[i], on ? (H?HIGH:LOW) : (H?LOW:HIGH));
+}
+
+// Storage
+void saveStates(){
+  File f=LittleFS.open("/states.json","w"); if(!f) return;
+  StaticJsonDocument<96> doc;
+  for(int i=0;i<NUM_DEVICES;i++) doc.add(device_state[i]);
+  serializeJson(doc,f); f.close();
+}
+void loadStates(){
+  if(LittleFS.exists("/states.json")){
+    File f=LittleFS.open("/states.json","r");
+    StaticJsonDocument<96> doc;
+    if(deserializeJson(doc,f)==DeserializationError::Ok){
+      for(int i=0;i<NUM_DEVICES;i++) device_state[i] = doc[i] | false;
+    }
+    f.close();
+  } else { for(int i=0;i<NUM_DEVICES;i++) device_state[i]=false; }
+  for(int i=0;i<NUM_DEVICES;i++) applyRelayOutput(i, device_state[i]);
+}
+void saveConfig(){
+  DynamicJsonDocument doc(1024);
+  doc["room_name"]=roomName; doc["sensor_type"]=sensorType;
+  JsonArray arr=doc.createNestedArray("devices");
+  for(int i=0;i<NUM_DEVICES;i++){ JsonObject d=arr.createNestedObject(); d["name"]=deviceNames[i]; d["logic"]=logicToStr(deviceLogicHigh[i]); }
+  File f=LittleFS.open("/config.json","w"); if(!f) return; serializeJson(doc,f); f.close();
+}
+void loadConfig(){
+  roomName=DEFAULT_ROOM_NAME; sensorType=DEFAULT_SENSOR_TYPE;
+  for(int i=0;i<NUM_DEVICES;i++){ deviceNames[i]=DEFAULT_DEVICE_NAMES[i]; deviceLogicHigh[i]=DEFAULT_DEVICE_LOGICS[i]; }
+  if(LittleFS.exists("/config.json")){
+    File f=LittleFS.open("/config.json","r");
+    DynamicJsonDocument doc(1024);
+    if(deserializeJson(doc,f)==DeserializationError::Ok){
+      roomName=String(doc["room_name"]|roomName);
+      sensorType=String(doc["sensor_type"]|sensorType);
+      JsonArray arr=doc["devices"].as<JsonArray>();
+      if(!arr.isNull()){
+        int i=0; for(JsonObject d:arr){ if(i>=NUM_DEVICES) break;
+          deviceNames[i]=String(d["name"]|deviceNames[i]);
+          deviceLogicHigh[i]=strToLogic(String(d["logic"]|logicToStr(deviceLogicHigh[i])));
+          i++;
+        }
+      }
+    }
+    f.close();
+  }
+  if(sensorType=="DHT11"){ dht=DHT(SENSOR_PIN, DHT11); dht.begin(); }
+  else if(sensorType=="DHT22"){ dht=DHT(SENSOR_PIN, DHT22); dht.begin(); }
+  for(int i=0;i<NUM_DEVICES;i++) applyRelayOutput(i, device_state[i]);
+}
+bool loadWiFi(){
+  if(!LittleFS.exists("/wifi.json")) return false;
+  File f=LittleFS.open("/wifi.json","r");
+  StaticJsonDocument<160> doc;
+  if(deserializeJson(doc,f)==DeserializationError::Ok){
+    wifiSSID = String(doc["ssid"] | "");
+    wifiPASS = String(doc["pass"] | "");
+  }
+  f.close();
+  return wifiSSID.length()>0;
+}
+void saveWiFi(const String& ssid, const String& pass){
+  File f=LittleFS.open("/wifi.json","w"); if(!f) return;
+  StaticJsonDocument<160> doc; doc["ssid"]=ssid; doc["pass"]=pass; serializeJson(doc,f); f.close();
+}
+void clearWiFi(){ LittleFS.remove("/wifi.json"); }
+
+void saveHubCache(IPAddress ip){ File f=LittleFS.open("/hub.json","w"); if(!f) return; StaticJsonDocument<64> d; d["ip"]=ip.toString(); serializeJson(d,f); f.close(); }
+bool loadHubCache(IPAddress& ip){ if(!LittleFS.exists("/hub.json")) return false; File f=LittleFS.open("/hub.json","r"); StaticJsonDocument<64> d; if(deserializeJson(d,f)==DeserializationError::Ok){ String s=d["ip"]|""; f.close(); return ip.fromString(s); } f.close(); return false; }
+
+// UDP discovery
+bool discoverHubUDP(IPAddress& out){
+  udp.beginPacket(IPAddress(255,255,255,255), DISCOVERY_PORT);
+  udp.write((const uint8_t*)DISCOVERY_REQ, strlen(DISCOVERY_REQ));
+  udp.endPacket();
+  unsigned long t0=millis();
+  while(millis()-t0 < HUB_DISCOVERY_TIMEOUT_MS){
+    int sz=udp.parsePacket(); if(sz>0){
+      char buf[64]; int len=udp.read(buf,sizeof(buf)-1);
+      if(len>0){ buf[len]=0; String m=String(buf); m.trim();
+        if(m.startsWith(DISCOVERY_PREFIX)){
+          int p1=m.indexOf('|'), p2=m.indexOf('|',p1+1);
+          if(p1>=0 && p2>p1){ String ipStr=m.substring(p1+1,p2); IPAddress ip; if(ip.fromString(ipStr)){ out=ip; return true; } }
+        }
+      }
+    }
+    yield();
+  }
+  return false;
+}
+
+// Quick for status
+bool ensureHubIPQuickForStatus(){
+  if (hubCacheValid && (millis()-lastResolveTime)<RESOLVE_TTL_MS) return true;
+  IPAddress saved; if(loadHubCache(saved)){ hubCachedIP=saved; hubCacheValid=true; lastResolveTime=millis(); return true; }
+  IPAddress ip; if(discoverHubUDP(ip)){ hubCachedIP=ip; hubCacheValid=true; lastResolveTime=millis(); saveHubCache(ip); return true; }
+  return false;
+}
+
+// General (Backoff)
+bool ensureHubIPGeneral(){
+  if (millis() < hubBackoffUntil) return false;
+  if (hubCacheValid && (millis()-lastResolveTime)<RESOLVE_TTL_MS) return true;
+  IPAddress ip; if(discoverHubUDP(ip)){ hubCachedIP=ip; hubCacheValid=true; lastResolveTime=millis(); saveHubCache(ip); return true; }
+  IPAddress saved; if(loadHubCache(saved)){ hubCachedIP=saved; hubCacheValid=true; lastResolveTime=millis(); return true; }
+  return false;
+}
+
+String buildHubURLQuickStatus(const char* path){
+  if(WiFi.status()!=WL_CONNECTED) return String();
+  if(!ensureHubIPQuickForStatus()) return String();
+  return String("http://")+hubCachedIP.toString()+String(path);
+}
+String buildHubURLGeneral(const char* path){
+  if(WiFi.status()!=WL_CONNECTED) return String();
+  if(!ensureHubIPGeneral()) return String();
+  return String("http://")+hubCachedIP.toString()+String(path);
+}
+
+// Reporting
+void queueStatusReport(int i){ if(i<0||i>=NUM_DEVICES) return; pending_report_mask |= (1UL<<i); }
+bool sendStatusNow(int i){
+  if(WiFi.status()!=WL_CONNECTED) return false;
+  String url=buildHubURLQuickStatus("/status"); if(url.length()==0) return false;
+
+  HTTPClient http; http.begin(wifi_client, url);
+  http.addHeader("Content-Type","application/json");
+  http.setTimeout(300);
+
+  StaticJsonDocument<160> doc;
+  doc["room_name"]=roomName; doc["device"]=deviceNames[i]; doc["state"]=device_state[i]?"ON":"OFF";
+  String body; serializeJson(doc, body);
+  int code=http.POST(body); http.end();
+
+  return (code>0 && code<400);
+}
+void processPendingReports(){
+  if(pending_report_mask==0) return;
+  if(WiFi.status()!=WL_CONNECTED) return;
+
+  for(int i=0;i<NUM_DEVICES;i++){
+    if(pending_report_mask & (1UL<<i)){
+      bool ok=sendStatusNow(i);
+      if(ok) pending_report_mask &= ~(1UL<<i);
+      break;
+    }
+  }
+}
+
+// Discover/Sensor (Backoff)
+void announceToHub(){
+  if(WiFi.status()!=WL_CONNECTED){ last_announce_time=millis(); announce_interval=30000; return; }
+  if (millis() < hubBackoffUntil) { last_announce_time=millis(); return; }
+  String url=buildHubURLGeneral("/discover"); if(url.length()==0){ last_announce_time=millis(); announce_interval=30000; hubBackoffUntil=millis()+HUB_BACKOFF_MS; return; }
+
+  HTTPClient http; http.begin(wifi_client, url);
+  http.addHeader("Content-Type","application/json");
+  http.setTimeout(1200);
+
+  DynamicJsonDocument doc(1024);
+  doc["room_name"]=roomName; doc["sensor_type"]=sensorType;
+  JsonArray arr=doc.createNestedArray("devices");
+  for(int i=0;i<NUM_DEVICES;i++){ JsonObject d=arr.createNestedObject(); d["name"]=deviceNames[i]; d["logic"]=logicToStr(deviceLogicHigh[i]); d["state"]=device_state[i]?"ON":"OFF"; }
+  String body; serializeJson(doc, body);
+
+  int code=http.POST(body); http.end();
+  if(code>0 && code<400){ announce_interval=60000; }
+  else { announce_interval=30000; hubBackoffUntil=millis()+HUB_BACKOFF_MS; }
+  last_announce_time=millis();
+}
+
+void readAndReportSensorData(){
+  if(sensorType=="NONE") return;
+  if(millis()-last_sensor_read_time < sensor_read_interval) return;
+  last_sensor_read_time = millis();
+
+  float h=dht.readHumidity(), t=dht.readTemperature();
+  if(isnan(h)||isnan(t)) return;
+  if(WiFi.status()!=WL_CONNECTED) return;
+  if (millis() < hubBackoffUntil) return;
+
+  String url=buildHubURLGeneral("/sensor_data"); if(url.length()==0){ hubBackoffUntil=millis()+HUB_BACKOFF_MS; return; }
+
+  HTTPClient http; http.begin(wifi_client, url);
+  http.addHeader("Content-Type","application/json");
+  http.setTimeout(500);
+
+  DynamicJsonDocument doc(256);
+  doc["room_name"]=roomName; doc["sensor_type"]=sensorType;
+  JsonObject data=doc.createNestedObject("data"); data["temperature"]=t; data["humidity"]=h;
+  String body; serializeJson(doc, body);
+  http.POST(body); http.end();
+}
+
+// Buttons / Reset
+void setDeviceState(int i, bool st){ if(i<0||i>=NUM_DEVICES) return; if(device_state[i]==st) return; device_state[i]=st; applyRelayOutput(i,st); saveStates(); }
+
+unsigned long resetHoldStart=0;
+void performFactoryResetAndReboot(){
+  Serial.println("[RESET] Factory reset...");
+  LittleFS.remove("/config.json"); LittleFS.remove("/states.json"); LittleFS.remove("/hub.json"); LittleFS.remove("/wifi.json");
+  roomName=DEFAULT_ROOM_NAME; sensorType=DEFAULT_SENSOR_TYPE;
+  for(int i=0;i<NUM_DEVICES;i++){ deviceNames[i]=DEFAULT_DEVICE_NAMES[i]; deviceLogicHigh[i]=DEFAULT_DEVICE_LOGICS[i]; device_state[i]=false; applyRelayOutput(i,false); }
+  saveConfig(); saveStates();
+  rebootScheduled=true; rebootAt=millis()+1000;
+}
+void checkFactoryResetBtn(){
+  int r=digitalRead(RESET_BTN_PIN);
+  if(r==LOW){ if(resetHoldStart==0) resetHoldStart=millis(); else if(millis()-resetHoldStart>=LONG_RESET_MS) performFactoryResetAndReboot(); }
+  else resetHoldStart=0;
+}
+
+void checkButtons(){
+  unsigned long now=millis();
+  for(int i=0;i<NUM_DEVICES;i++){
+    bool reading=digitalRead(BUTTON_PINS[i]);
+    if(reading!=last_button_reading[i]){ last_press_time[i]=now; last_button_reading[i]=reading; }
+    if((now-last_press_time[i])>debounce_delay){
+      if(reading!=stable_button_state[i]){
+        stable_button_state[i]=reading;
+        if(reading==LOW){ setDeviceState(i, !device_state[i]); queueStatusReport(i); }
+      }
+    }
+  }
+  yield();
+}
+
+// HTTP (مع تغيير /command)
+void setupServer(){
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin","*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers","Content-Type");
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+    if(!provisioningMode){ req->send(200,"text/plain","Node OK"); return; }
+    IPAddress ip = WiFi.softAPIP();
+    String html = String()+
+    "<!DOCTYPE html><html lang='ar'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'/>"
+    "<title>اعداد النود</title><style>body{font-family:sans-serif;direction:rtl;padding:24px}input,button{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;margin:6px 0}button{background:#2c3e50;color:#fff;border:0} .card{max-width:420px;margin:auto;border:1px solid #eee;padding:16px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,.06)}</style></head><body>"
+    "<div class='card'><h2>إعداد الاتصال بالراوتر</h2>"
+    "<form method='POST' action='/save_wifi'>"
+    "<label>اسم الشبكة (SSID)</label><input name='ssid' required>"
+    "<label>كلمة المرور</label><input name='pass' type='password'>"
+    "<button type='submit'>حفظ والاتصال</button></form>"
+    "<p style='font-size:12px;color:#777'>IP: "+ip.toString()+"</p></div></body></html>";
+    req->send(200,"text/html",html);
+  });
+  server.on("/save_wifi", HTTP_POST, [](AsyncWebServerRequest *req){
+    if(!provisioningMode){ req->send(403,"text/plain","Forbidden"); return; }
+    String ssid = req->hasParam("ssid", true) ? req->getParam("ssid", true)->value() : "";
+    String pass = req->hasParam("pass", true) ? req->getParam("pass", true)->value() : "";
+    if(ssid.length()==0){ req->send(400,"text/plain","SSID required"); return; }
+    saveWiFi(ssid, pass);
+    req->send(200,"text/plain","Saved. Rebooting...");
+    rebootScheduled=true; rebootAt=millis()+1000;
+  });
+  server.onNotFound([](AsyncWebServerRequest *req){
+    if (provisioningMode) { req->send(200,"text/html","<meta http-equiv='refresh' content='0; url=/' />"); }
+    else req->send(404,"text/plain","Not found");
+  });
+
+  // /command: بافر أكبر + لوج
+  server.on("/command", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      StaticJsonDocument<256> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        Serial.printf("[CMD] JSON parse error: %s\n", err.c_str());
+        request->send(400,"text/plain","Invalid JSON");
+        return;
+      }
+      const char* dev = doc["device"];
+      const char* st  = doc["state"];
+      if(!dev || !st){ request->send(400,"text/plain","Missing fields"); return; }
+
+      bool ns = (strcmp(st,"ON")==0);
+      Serial.printf("[CMD] Device: %s | State: %s\n", dev, st);
+
+      for(int i=0;i<NUM_DEVICES;i++){
+        if(strcmp(dev, deviceNames[i].c_str())==0){
+          setDeviceState(i, ns);
+          request->send(200,"text/plain","OK");
+          return;
+        }
+      }
+      request->send(404,"text/plain","Device not found");
+    }
+  );
+
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *req){
+    DynamicJsonDocument doc(1024);
+    doc["room_name"]=roomName; doc["sensor_type"]=sensorType;
+    JsonArray arr=doc.createNestedArray("devices");
+    for(int i=0;i<NUM_DEVICES;i++){ JsonObject d=arr.createNestedObject(); d["name"]=deviceNames[i]; d["logic"]=logicToStr(deviceLogicHigh[i]); }
+    String json; serializeJson(doc,json);
+    req->send(200,"application/json; charset=utf-8", json);
+  });
+  server.on("/config", HTTP_POST, [](AsyncWebServerRequest *req){}, NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total){
+      DynamicJsonDocument doc(2048);
+      if(deserializeJson(doc,data,len)){ req->send(400,"text/plain","Invalid JSON"); return; }
+      if(doc.containsKey("room_name"))   roomName   = String(doc["room_name"].as<const char*>());
+      if(doc.containsKey("sensor_type")) sensorType = String(doc["sensor_type"].as<const char*>());
+      if(doc.containsKey("devices")){
+        JsonArray arr=doc["devices"].as<JsonArray>();
+        int i=0; for(JsonObject d:arr){ if(i>=NUM_DEVICES) break;
+          if(d.containsKey("name"))  deviceNames[i]=String(d["name"].as<const char*>());
+          if(d.containsKey("logic")) deviceLogicHigh[i]=strToLogic(String(d["logic"].as<const char*>()));
+          i++;
+        }
+      }
+      if(sensorType=="DHT11"){ dht=DHT(SENSOR_PIN, DHT11); dht.begin(); }
+      else if(sensorType=="DHT22"){ dht=DHT(SENSOR_PIN, DHT22); dht.begin(); }
+      for(int i=0;i<NUM_DEVICES;i++) applyRelayOutput(i, device_state[i]);
+      saveConfig();
+      req->send(200,"text/plain","Config saved. Rebooting...");
+      rebootScheduled=true; rebootAt=millis()+1000;
+    }
+  );
+
+  server.on("/config", HTTP_OPTIONS, [](AsyncWebServerRequest *r){ r->send(200); });
+  server.on("/command", HTTP_OPTIONS, [](AsyncWebServerRequest *r){ r->send(200); });
+
+  server.begin();
+}
+
+// WiFi / Provisioning
+void startProvisioningAP(){
+  provisioningMode=true;
+  WiFi.mode(WIFI_AP);
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char ssid[32]; snprintf(ssid,sizeof(ssid),"TahaNode-Setup-%02X%02X", mac[4], mac[5]);
+  WiFi.softAP(ssid, "1212121212", 6, false);
+  IPAddress apIP = WiFi.softAPIP();
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(DNS_PORT, "*", apIP);
+  Serial.printf("[PROV] AP %s @ %s\n", ssid, apIP.toString().c_str());
+}
+
+void maintainWiFi(){
+  unsigned long now=millis();
+  if(now-last_wifi_check>=WIFI_RETRY_MS){
+    last_wifi_check=now;
+    if(!provisioningMode && WiFi.status()!=WL_CONNECTED){
+      Serial.println("[WiFi] Lost. Retrying...");
+      WiFi.disconnect(); WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+      hubCacheValid=false;
+    }
+  }
+}
+
+// Setup / Loop
+void setup(){
+  Serial.begin(115200);
+  Serial.println("\n[Node] Booting... V7.2.1 (No mDNS, UDP only, Instant Status, /command 256B)");
+
+  pinMode(RESET_BTN_PIN, INPUT_PULLUP);
+  for(int i=0;i<NUM_DEVICES;i++) pinMode(DEVICE_PINS[i], OUTPUT);
+  for(int i=0;i<NUM_DEVICES;i++) pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT); digitalWrite(LED_BUILTIN, HIGH);
+
+  LittleFS.begin();
+  loadStates();
+  loadConfig();
+
+  if(loadWiFi()){
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+    Serial.print("[WiFi] Connecting");
+    unsigned long t0=millis();
+    while(WiFi.status()!=WL_CONNECTED && millis()-t0<20000){ delay(500); Serial.print("."); }
+    if(WiFi.status()==WL_CONNECTED){
+      Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+      if(udp.begin(UDP_LOCAL_PORT)) Serial.printf("[UDP] Local %u\n", UDP_LOCAL_PORT);
+      ensureHubIPQuickForStatus();
+      announceToHub();
+    } else {
+      Serial.println("\n[WiFi] Failed. Will keep retrying in background.");
+      provisioningMode = false;
+    }
+  } else {
+    Serial.println("[WiFi] No creds. Enter provisioning (AP).");
+    startProvisioningAP();
+  }
+
+  setupServer();
+}
+
+void loop(){
+  checkButtons();
+  checkFactoryResetBtn();
+
+  if(provisioningMode){
+    dnsServer.processNextRequest();
+  } else {
+    processPendingReports();   // حالة فورية
+    readAndReportSensorData(); // Backoff
+    maintainWiFi();
+    if(millis()-last_announce_time>announce_interval) announceToHub();
+  }
+
+  if(rebootScheduled && millis()>=rebootAt){
+    Serial.println("[SYS] Rebooting...");
+    delay(50);
+    ESP.restart();
+  }
+}
